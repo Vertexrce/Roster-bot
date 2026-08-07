@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import re
@@ -26,6 +27,17 @@ MAIN_GUILD_ID = int(
 )
 MAX_MEMBERS = int(os.getenv("MAX_MEMBERS", "200"))
 INVITE_EXPIRY_DAYS = int(os.getenv("INVITE_EXPIRY_DAYS", "7"))
+
+
+def schema_unavailable_embed(bot: commands.Bot) -> discord.Embed:
+    missing = getattr(bot, "rce_schema_missing", ())
+    missing_text = ", ".join(missing) if missing else "the required clan tables"
+    return error_embed(
+        "Recruitment is temporarily unavailable",
+        "The bot is connected, but it cannot find the RCE/Valora clan database. "
+        f"Missing: `{missing_text}`. An administrator must set `DB_PATH` to the "
+        "real `ruin.sqlite3` file and restart the bot.",
+    )
 
 
 def error_embed(title: str, description: str) -> discord.Embed:
@@ -183,6 +195,12 @@ class InviteView(discord.ui.View):
         self.add_item(decline)
 
     async def accept(self, interaction: discord.Interaction) -> None:
+        if not getattr(self.cog.bot, "rce_schema_ready", False):
+            return await interaction.response.send_message(
+                embed=schema_unavailable_embed(self.cog.bot),
+                ephemeral=True,
+            )
+
         invite = await fetchone(
             "SELECT * FROM clan_invites WHERE id=?",
             (self.invite_id,),
@@ -302,6 +320,12 @@ class InviteView(discord.ui.View):
             )
 
     async def decline(self, interaction: discord.Interaction) -> None:
+        if not getattr(self.cog.bot, "rce_schema_ready", False):
+            return await interaction.response.send_message(
+                embed=schema_unavailable_embed(self.cog.bot),
+                ephemeral=True,
+            )
+
         invite = await fetchone(
             "SELECT * FROM clan_invites WHERE id=?",
             (self.invite_id,),
@@ -439,7 +463,7 @@ class RecruitCog(commands.Cog):
 
         return clan, role, None
 
-    async def do_recruit(
+    async def _do_recruit_impl(
         self,
         interaction: discord.Interaction,
         role: discord.Role,
@@ -460,6 +484,10 @@ class RecruitCog(commands.Cog):
             )
 
         await interaction.response.defer()
+        progress = await interaction.followup.send(
+            f"Checking **{role.name}** and preparing invitations…",
+            wait=True,
+        )
         main_guild = self.bot.get_guild(MAIN_GUILD_ID)
         if main_guild is None:
             return await interaction.followup.send(
@@ -526,8 +554,13 @@ class RecruitCog(commands.Cog):
             main_member = main_guild.get_member(source_member.id)
             if main_member is None:
                 try:
-                    main_member = await main_guild.fetch_member(source_member.id)
+                    main_member = await asyncio.wait_for(
+                        main_guild.fetch_member(source_member.id),
+                        timeout=15,
+                    )
                 except (discord.NotFound, discord.HTTPException):
+                    main_member = None
+                except asyncio.TimeoutError:
                     main_member = None
             if main_member is None:
                 skipped.append(f"{tag} — not in {SERVER_NAME}")
@@ -582,9 +615,12 @@ class RecruitCog(commands.Cog):
             )
             invite_embed.set_footer(text=f"Invite expires in {INVITE_EXPIRY_DAYS} days")
             try:
-                message = await main_member.send(
-                    embed=invite_embed,
-                    view=InviteView(self, invite_id),
+                message = await asyncio.wait_for(
+                    main_member.send(
+                        embed=invite_embed,
+                        view=InviteView(self, invite_id),
+                    ),
+                    timeout=15,
                 )
                 await execute(
                     "UPDATE clan_invites SET invite_message_id=? WHERE id=?",
@@ -603,6 +639,24 @@ class RecruitCog(commands.Cog):
                     (int(time.time()), invite_id),
                 )
                 failed.append(f"{tag} — Discord error {exc.status}")
+            except asyncio.TimeoutError:
+                await execute(
+                    "UPDATE clan_invites SET status='delivery_failed', responded_at=? WHERE id=?",
+                    (int(time.time()), invite_id),
+                )
+                failed.append(f"{tag} — Discord took too long to deliver the DM")
+
+            processed = len(sent) + len(skipped) + len(failed)
+            if processed == 1 or processed % 10 == 0:
+                try:
+                    await progress.edit(
+                        content=(
+                            f"Processed **{processed}/{len(source_members)}** members "
+                            f"({len(sent)} invites sent)…"
+                        )
+                    )
+                except discord.HTTPException:
+                    pass
 
         summary = success_embed(
             f"Recruit invitations sent · [{clan['clantag']}] {clan['name']}",
@@ -626,6 +680,40 @@ class RecruitCog(commands.Cog):
                 inline=False,
             )
         await interaction.followup.send(embed=summary)
+
+    async def do_recruit(
+        self,
+        interaction: discord.Interaction,
+        role: discord.Role,
+        clan_name: Optional[str] = None,
+    ) -> None:
+        """Run recruitment and always resolve the Discord interaction."""
+        if not getattr(self.bot, "rce_schema_ready", False):
+            return await interaction.response.send_message(
+                embed=schema_unavailable_embed(self.bot),
+                ephemeral=True,
+            )
+
+        try:
+            await self._do_recruit_impl(interaction, role, clan_name)
+        except Exception as exc:
+            log.exception("Unhandled /clan recruit error")
+            message = (
+                "The recruitment could not finish. Check the bot logs for the "
+                f"error details.\n`{type(exc).__name__}`"
+            )
+            try:
+                if interaction.response.is_done():
+                    await interaction.followup.send(
+                        embed=error_embed("Recruitment error", message)
+                    )
+                else:
+                    await interaction.response.send_message(
+                        embed=error_embed("Recruitment error", message),
+                        ephemeral=True,
+                    )
+            except (discord.HTTPException, discord.NotFound):
+                log.exception("Could not send /clan recruit error response")
 
 
 async def setup(bot: commands.Bot) -> None:
