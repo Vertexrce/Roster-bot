@@ -34,9 +34,9 @@ def schema_unavailable_embed(bot: commands.Bot) -> discord.Embed:
     missing_text = ", ".join(missing) if missing else "the required clan tables"
     return error_embed(
         "Recruitment is temporarily unavailable",
-        "The bot is connected, but it cannot find the RCE/Valora clan database. "
-        f"Missing: `{missing_text}`. An administrator must set `DB_PATH` to the "
-        "real `ruin.sqlite3` file and restart the bot.",
+        "The bot is connected, but it cannot find the shared Vertex clan database. "
+        f"Missing: `{missing_text}`. An administrator must set `DB_PATH` to "
+        "`/data/Vertex.sqlite3` and restart the bot.",
     )
 
 
