@@ -63,9 +63,8 @@ class RosterBot(commands.Bot):
         self.rce_schema_ready = not missing
         if missing:
             log.error(
-                "RCE database schema is missing: %s. "
-                "Recruitment commands will remain disabled until DB_PATH points "
-                "to the shared Vertex.sqlite3 file. Current DB_PATH=%s",
+                "Clan database schema could not be initialized: %s. "
+                "Recruitment commands remain disabled. DB_PATH=%s",
                 ", ".join(missing),
                 os.getenv("DB_PATH", "<default: /data/Vertex.sqlite3>"),
             )
@@ -76,11 +75,19 @@ class RosterBot(commands.Bot):
                 DB_PATH,
             )
         else:
-            log.info(
-                "Using RCE database %s (%d clan(s))",
-                os.getenv("DB_PATH", "<default: /data/Vertex.sqlite3>"),
-                clan_count or 0,
-            )
+            if clan_count:
+                log.info(
+                    "Using clan database %s (%d clan(s))",
+                    os.getenv("DB_PATH", "<default: /data/Vertex.sqlite3>"),
+                    clan_count,
+                )
+            else:
+                log.warning(
+                    "Clan schema is ready at %s, but no clans exist. "
+                    "Recreate clans with the normal RCE clan setup commands; "
+                    "old clan records were not present in the uploaded source ZIPs.",
+                    os.getenv("DB_PATH", "<default: /data/Vertex.sqlite3>"),
+                )
 
         # Global sync makes /clan recruit available in every server the bot
         # belongs to. Set COMMAND_SYNC_GUILD_ID for an immediate test copy.
