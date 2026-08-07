@@ -762,11 +762,106 @@ async def setup(bot: commands.Bot) -> None:
 
     existing = bot.tree.get_command("clan")
     if isinstance(existing, app_commands.Group):
-        existing.add_command(command)
+        group = existing
     else:
         group = app_commands.Group(name="clan", description="Clan operations")
-        group.add_command(command)
         bot.tree.add_command(group)
+
+    async def register_callback(
+        interaction: discord.Interaction,
+        name: str,
+        clantag: str,
+        role: discord.Role,
+        server_id: str = "default",
+        description: Optional[str] = None,
+    ) -> None:
+        """Recreate a clan record when the original database is unavailable."""
+        if interaction.guild is None or interaction.guild.id != MAIN_GUILD_ID:
+            return await interaction.response.send_message(
+                "This command must be used in the configured main server.",
+                ephemeral=True,
+            )
+        if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+            return await interaction.response.send_message(
+                "Only a server administrator can register a clan.",
+                ephemeral=True,
+            )
+
+        clean_name = name.strip()
+        clean_tag = clantag.strip()
+        clean_server_id = server_id.strip() or "default"
+        if not clean_name or not clean_tag:
+            return await interaction.response.send_message(
+                "Clan name and tag cannot be blank.",
+                ephemeral=True,
+            )
+
+        existing_clan = await fetchone(
+            """
+            SELECT id FROM clans
+            WHERE guild_id=? AND server_id=?
+              AND (LOWER(name)=LOWER(?) OR LOWER(clantag)=LOWER(?))
+            """,
+            (interaction.guild.id, clean_server_id, clean_name, clean_tag),
+        )
+        if existing_clan:
+            return await interaction.response.send_message(
+                "A clan with that name or tag already exists for this server ID.",
+                ephemeral=True,
+            )
+
+        await execute(
+            """
+            INSERT INTO clans (
+                guild_id, server_id, name, clantag, color, description,
+                owner_id, role_id, created_at
+            ) VALUES (?, ?, ?, ?, '#ffffff', ?, ?, ?, ?)
+            """,
+            (
+                interaction.guild.id,
+                clean_server_id,
+                clean_name,
+                clean_tag,
+                description.strip() if description else None,
+                interaction.user.id,
+                role.id,
+                int(time.time()),
+            ),
+        )
+        await execute(
+            """
+            INSERT OR IGNORE INTO clan_server_config (guild_id, server_id)
+            VALUES (?, ?)
+            """,
+            (interaction.guild.id, clean_server_id),
+        )
+        await interaction.response.send_message(
+            embed=success_embed(
+                "Clan registered",
+                f"**[{clean_tag}] {clean_name}** is ready for recruitment.\n"
+                f"Registered role: {role.mention}\n"
+                f"Server ID: `{clean_server_id}`\n\n"
+                "The administrator who registered it can now run "
+                "`/clan recruit` from a roster server.",
+            ),
+            ephemeral=True,
+        )
+
+    register_command = app_commands.Command(
+        name="register",
+        description="Register a clan after rebuilding the clan database.",
+        callback=register_callback,
+    )
+    app_commands.describe(
+        name="Display name for the clan",
+        clantag="Short clan tag",
+        role="The main-server role assigned to clan members",
+        server_id="RCE server grouping identifier",
+        description="Optional clan description",
+    )(register_command)
+    app_commands.default_permissions(administrator=True)(register_command)
+    group.add_command(command)
+    group.add_command(register_command)
 
 
 async def teardown(bot: commands.Bot) -> None:
