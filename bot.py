@@ -9,9 +9,9 @@ import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
-from db import init_db
-
 load_dotenv()
+
+from db import get_schema_status, init_db
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -44,7 +44,20 @@ class RosterBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await init_db()
-        await self.load_extension("cogs.recruit")
+
+        # This is a separate bot. It loads clan extensions from its own cogs
+        # package and does not depend on the RCE bot's auto-loader.
+        await self.load_extension("cogs.clans")
+
+        missing, clan_count = await get_schema_status()
+        if missing:
+            log.error(
+                "RCE database schema is missing: %s. "
+                "Set DB_PATH to the RCE ruin.sqlite3 file.",
+                ", ".join(missing),
+            )
+        else:
+            log.info("Using RCE database %s (%d clan(s))", os.getenv("DB_PATH", "<default>"), clan_count or 0)
 
         # Global sync makes /clan recruit available in every server the bot
         # belongs to. Set COMMAND_SYNC_GUILD_ID for an immediate test copy.
@@ -70,8 +83,11 @@ def main() -> None:
             "Missing DISCORD_TOKEN. Copy .env.example to .env and add your bot token."
         )
 
-    # Accept either the new name or the name used by the uploaded cog.
-    required_int("MAIN_GUILD_ID", os.getenv("VESTIGE_GUILD_ID"))
+    # Accept the RCE name first, with aliases for older roster deployments.
+    required_int(
+        "GUILD_ID",
+        os.getenv("MAIN_GUILD_ID", os.getenv("VESTIGE_GUILD_ID")),
+    )
 
     bot = RosterBot()
     bot.run(token, log_handler=None)

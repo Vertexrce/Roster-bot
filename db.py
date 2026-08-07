@@ -1,7 +1,8 @@
-"""Small SQLite data layer used by the roster bot.
+"""SQLite data layer shared with the RCE/Valora clan bot.
 
-The clan tables intentionally use the same names and core columns as the
-uploaded cog so an existing SQLite database can be copied into this folder.
+The RCE bot's source of truth is DB_PATH and its default file is
+~/.ruin-bot/ruin.sqlite3. This bot deliberately uses that same variable and
+does not create a replacement clans database.
 """
 
 from __future__ import annotations
@@ -13,7 +14,14 @@ from typing import Any, Iterable
 
 import aiosqlite
 
-DB_PATH = Path(os.getenv("DATABASE_PATH", "data/roster.db"))
+
+def _default_db_path() -> str:
+    return str(Path.home() / ".ruin-bot" / "ruin.sqlite3")
+
+
+# DB_PATH is the variable used by the uploaded RCE bot. DATABASE_PATH remains
+# a backwards-compatible alias for older roster-bot deployments.
+DB_PATH = Path(os.getenv("DB_PATH", os.getenv("DATABASE_PATH", _default_db_path())))
 
 
 async def init_db() -> None:
@@ -21,33 +29,6 @@ async def init_db() -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.executescript(
             """
-            CREATE TABLE IF NOT EXISTS clans (
-                id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id   INTEGER NOT NULL,
-                server_id  TEXT NOT NULL,
-                name       TEXT NOT NULL,
-                clantag    TEXT NOT NULL,
-                owner_id   INTEGER NOT NULL,
-                role_id    INTEGER,
-                channel_id INTEGER
-            );
-
-            CREATE TABLE IF NOT EXISTS clan_members (
-                clan_id    INTEGER NOT NULL,
-                user_id    INTEGER NOT NULL,
-                clan_role  TEXT NOT NULL DEFAULT 'member',
-                joined_at  INTEGER NOT NULL,
-                PRIMARY KEY (clan_id, user_id)
-            );
-
-            CREATE TABLE IF NOT EXISTS clan_server_config (
-                guild_id                INTEGER NOT NULL,
-                server_id               TEXT NOT NULL,
-                active_clans_channel_id INTEGER,
-                active_clans_message_id INTEGER,
-                PRIMARY KEY (guild_id, server_id)
-            );
-
             CREATE TABLE IF NOT EXISTS guild_clan_link (
                 guild_id     INTEGER PRIMARY KEY,
                 clan_role_id INTEGER NOT NULL,
@@ -72,6 +53,26 @@ async def init_db() -> None:
             """
         )
         await db.commit()
+
+
+async def get_schema_status() -> tuple[list[str], int | None]:
+    """Return missing RCE tables and the current clan count."""
+    required = ("clans", "clan_members", "clan_server_config")
+    async with aiosqlite.connect(DB_PATH) as db:
+        rows = await db.execute_fetchall(
+            """
+            SELECT name FROM sqlite_master
+            WHERE type='table' AND name IN (?, ?, ?)
+            """,
+            required,
+        )
+        present = {str(row[0]) for row in rows}
+        missing = [name for name in required if name not in present]
+        if "clans" not in present:
+            return missing, None
+        async with db.execute("SELECT COUNT(*) FROM clans") as cursor:
+            row = await cursor.fetchone()
+        return missing, int(row[0]) if row else 0
 
 
 async def fetchone(query: str, params: Iterable[Any] = ()) -> aiosqlite.Row | None:
