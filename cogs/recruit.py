@@ -32,11 +32,28 @@ INVITE_EXPIRY_DAYS = int(os.getenv("INVITE_EXPIRY_DAYS", "7"))
 def schema_unavailable_embed(bot: commands.Bot) -> discord.Embed:
     missing = getattr(bot, "rce_schema_missing", ())
     missing_text = ", ".join(missing) if missing else "the required clan tables"
+    db_path = getattr(bot, "rce_db_path", "/data/Vertex.sqlite3")
+    db_existed = getattr(bot, "rce_db_existed_at_start", False)
+    db_size = getattr(bot, "rce_db_size_at_start", 0)
+    if not db_existed:
+        diagnosis = (
+            f"`{db_path}` was not present when the bot started. Attach the volume "
+            "containing Vertex.sqlite3 to this bot service."
+        )
+    elif db_size == 0:
+        diagnosis = (
+            f"`{db_path}` was empty when the bot started. Replace it with the real "
+            "shared Vertex.sqlite3 database."
+        )
+    else:
+        diagnosis = (
+            f"`{db_path}` exists ({db_size:,} bytes), but it is not the shared "
+            "Vertex database or does not contain the RCE clan schema."
+        )
     return error_embed(
         "Recruitment is temporarily unavailable",
-        "The bot is connected, but it cannot find the shared Vertex clan database. "
-        f"Missing: `{missing_text}`. An administrator must set `DB_PATH` to "
-        "`/data/Vertex.sqlite3` and restart the bot.",
+        f"{diagnosis}\n\nMissing: `{missing_text}`. Copy the real database to that "
+        "mounted path, then restart the bot.",
     )
 
 
