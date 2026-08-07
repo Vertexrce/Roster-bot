@@ -1,8 +1,8 @@
 """SQLite data layer shared with the RCE/Valora clan bot.
 
-The RCE bot's source of truth is DB_PATH and its default file is
-~/.ruin-bot/ruin.sqlite3. This bot deliberately uses that same variable and
-does not create a replacement clans database.
+The shared source of truth is DB_PATH and the deployment default is the
+Vertex database mounted at /data/Vertex.sqlite3. This bot deliberately uses
+that same database and does not create a replacement clans database.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import aiosqlite
 
 
 def _default_db_path() -> str:
-    return str(Path.home() / ".ruin-bot" / "ruin.sqlite3")
+    return "/data/Vertex.sqlite3"
 
 
 # DB_PATH is the variable used by the uploaded RCE bot. DATABASE_PATH remains

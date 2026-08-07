@@ -58,14 +58,14 @@ class RosterBot(commands.Bot):
             log.error(
                 "RCE database schema is missing: %s. "
                 "Recruitment commands will remain disabled until DB_PATH points "
-                "to the RCE/Valora ruin.sqlite3 file. Current DB_PATH=%s",
+                "to the shared Vertex.sqlite3 file. Current DB_PATH=%s",
                 ", ".join(missing),
-                os.getenv("DB_PATH", "<default: ~/.ruin-bot/ruin.sqlite3>"),
+                os.getenv("DB_PATH", "<default: /data/Vertex.sqlite3>"),
             )
         else:
             log.info(
                 "Using RCE database %s (%d clan(s))",
-                os.getenv("DB_PATH", "<default: ~/.ruin-bot/ruin.sqlite3>"),
+                os.getenv("DB_PATH", "<default: /data/Vertex.sqlite3>"),
                 clan_count or 0,
             )
 
