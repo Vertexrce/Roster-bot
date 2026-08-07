@@ -18,7 +18,12 @@ log = logging.getLogger("RosterBot.recruit")
 
 THEME_COLOR = int(os.getenv("THEME_COLOR", str(0xBF00FF)))
 SERVER_NAME = os.getenv("SERVER_NAME", "Main Server")
-MAIN_GUILD_ID = int(os.getenv("MAIN_GUILD_ID", os.getenv("VESTIGE_GUILD_ID", "0")))
+MAIN_GUILD_ID = int(
+    os.getenv(
+        "MAIN_GUILD_ID",
+        os.getenv("GUILD_ID", os.getenv("VESTIGE_GUILD_ID", "0")),
+    )
+)
 MAX_MEMBERS = int(os.getenv("MAX_MEMBERS", "200"))
 INVITE_EXPIRY_DAYS = int(os.getenv("INVITE_EXPIRY_DAYS", "7"))
 
