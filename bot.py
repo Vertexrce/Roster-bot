@@ -35,6 +35,8 @@ class RosterBot(commands.Bot):
         intents = discord.Intents.default()
         intents.guilds = True
         intents.members = True
+        self.rce_schema_ready = False
+        self.rce_schema_missing: tuple[str, ...] = ()
 
         super().__init__(
             command_prefix=commands.when_mentioned,
@@ -50,14 +52,22 @@ class RosterBot(commands.Bot):
         await self.load_extension("cogs.clans")
 
         missing, clan_count = await get_schema_status()
+        self.rce_schema_missing = tuple(missing)
+        self.rce_schema_ready = not missing
         if missing:
             log.error(
                 "RCE database schema is missing: %s. "
-                "Set DB_PATH to the RCE ruin.sqlite3 file.",
+                "Recruitment commands will remain disabled until DB_PATH points "
+                "to the RCE/Valora ruin.sqlite3 file. Current DB_PATH=%s",
                 ", ".join(missing),
+                os.getenv("DB_PATH", "<default: ~/.ruin-bot/ruin.sqlite3>"),
             )
         else:
-            log.info("Using RCE database %s (%d clan(s))", os.getenv("DB_PATH", "<default>"), clan_count or 0)
+            log.info(
+                "Using RCE database %s (%d clan(s))",
+                os.getenv("DB_PATH", "<default: ~/.ruin-bot/ruin.sqlite3>"),
+                clan_count or 0,
+            )
 
         # Global sync makes /clan recruit available in every server the bot
         # belongs to. Set COMMAND_SYNC_GUILD_ID for an immediate test copy.
