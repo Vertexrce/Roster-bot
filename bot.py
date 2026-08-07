@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from db import get_schema_status, init_db
+from db import DB_PATH, get_schema_status, init_db
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -37,6 +37,9 @@ class RosterBot(commands.Bot):
         intents.members = True
         self.rce_schema_ready = False
         self.rce_schema_missing: tuple[str, ...] = ()
+        self.rce_db_path = str(DB_PATH)
+        self.rce_db_existed_at_start = False
+        self.rce_db_size_at_start = 0
 
         super().__init__(
             command_prefix=commands.when_mentioned,
@@ -45,6 +48,10 @@ class RosterBot(commands.Bot):
         )
 
     async def setup_hook(self) -> None:
+        self.rce_db_existed_at_start = DB_PATH.is_file()
+        if self.rce_db_existed_at_start:
+            self.rce_db_size_at_start = DB_PATH.stat().st_size
+
         await init_db()
 
         # This is a separate bot. It loads clan extensions from its own cogs
@@ -61,6 +68,12 @@ class RosterBot(commands.Bot):
                 "to the shared Vertex.sqlite3 file. Current DB_PATH=%s",
                 ", ".join(missing),
                 os.getenv("DB_PATH", "<default: /data/Vertex.sqlite3>"),
+            )
+            log.error(
+                "Database file before startup initialization: exists=%s size=%d bytes path=%s",
+                self.rce_db_existed_at_start,
+                self.rce_db_size_at_start,
+                DB_PATH,
             )
         else:
             log.info(
