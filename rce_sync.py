@@ -178,3 +178,13 @@ class RceSyncClient:
             },
         )
         return bool(result and result.get("ok"))
+
+    async def clear_clans(self, guild_id: int) -> bool:
+        """Remove all clan registrations for one main guild in the RCE DB."""
+        if not self.enabled:
+            return False
+        result = await self._request(
+            "DELETE",
+            f"/internal/roster/clans?guild_id={int(guild_id)}",
+        )
+        return bool(result and result.get("ok"))
