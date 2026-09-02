@@ -12,6 +12,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from db import DB_PATH, get_schema_status, init_db
+from rce_sync import RceSyncClient
 
 logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO").upper(),
@@ -40,6 +41,7 @@ class RosterBot(commands.Bot):
         self.rce_db_path = str(DB_PATH)
         self.rce_db_existed_at_start = False
         self.rce_db_size_at_start = 0
+        self.rce_sync = RceSyncClient()
 
         super().__init__(
             command_prefix=commands.when_mentioned,
@@ -53,6 +55,16 @@ class RosterBot(commands.Bot):
             self.rce_db_size_at_start = DB_PATH.stat().st_size
 
         await init_db()
+
+        if self.rce_sync.enabled:
+            mirrored = await self.rce_sync.pull_clans(required_int(
+                "MAIN_GUILD_ID",
+                os.getenv(
+                    "GUILD_ID",
+                    os.getenv("VESTIGE_GUILD_ID", "1539760704641437837"),
+                ),
+            ))
+            log.info("Mirrored %d clan record(s) from the RCE bot", mirrored)
 
         # This is a separate bot. It loads clan extensions from its own cogs
         # package and does not depend on the RCE bot's auto-loader.
@@ -84,22 +96,47 @@ class RosterBot(commands.Bot):
             else:
                 log.warning(
                     "Clan schema is ready at %s, but no clans exist. "
-                    "Recreate clans with the normal RCE clan setup commands; "
-                    "old clan records were not present in the uploaded source ZIPs.",
+                    "The first /clan recruit can auto-register a clan from its "
+                    "matching Discord role.",
                     os.getenv("DB_PATH", "<default: /data/Vertex.sqlite3>"),
                 )
 
         # Global sync makes /clan recruit available in every server the bot
         # belongs to. Set COMMAND_SYNC_GUILD_ID for an immediate test copy.
         sync_guild_id = os.getenv("COMMAND_SYNC_GUILD_ID")
+        main_guild_id = int(os.getenv(
+            "MAIN_GUILD_ID",
+            os.getenv("GUILD_ID", os.getenv("VESTIGE_GUILD_ID", "1539760704641437837")),
+        ))
         if sync_guild_id:
+            global_synced = await self.tree.sync()
             guild = discord.Object(id=int(sync_guild_id))
-            self.tree.copy_global_to(guild=guild)
+            # Do not replace the main-guild command set: it also contains the
+            # guild-scoped /clan register recovery command.
+            if int(sync_guild_id) != main_guild_id:
+                self.tree.copy_global_to(guild=guild)
             synced = await self.tree.sync(guild=guild)
-            log.info("Synced %d command(s) to test guild %s", len(synced), sync_guild_id)
+            main_synced = (
+                synced
+                if int(sync_guild_id) == main_guild_id
+                else await self.tree.sync(guild=discord.Object(id=main_guild_id))
+            )
+            log.info(
+                "Synced %d global command(s), %d test-guild command(s), "
+                "and %d main-guild command(s)",
+                len(global_synced),
+                len(synced),
+                len(main_synced),
+                sync_guild_id,
+            )
         else:
             synced = await self.tree.sync()
-            log.info("Synced %d global command(s)", len(synced))
+            main_synced = await self.tree.sync(guild=discord.Object(id=main_guild_id))
+            log.info(
+                "Synced %d global command(s) and %d main-guild command(s)",
+                len(synced),
+                len(main_synced),
+            )
 
     async def on_ready(self) -> None:
         if self.user:
@@ -116,7 +153,10 @@ def main() -> None:
     # Accept the RCE name first, with aliases for older roster deployments.
     required_int(
         "GUILD_ID",
-        os.getenv("MAIN_GUILD_ID", os.getenv("VESTIGE_GUILD_ID")),
+        os.getenv(
+            "MAIN_GUILD_ID",
+            os.getenv("VESTIGE_GUILD_ID", "1539760704641437837"),
+        ),
     )
 
     bot = RosterBot()
