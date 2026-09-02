@@ -22,11 +22,21 @@ SERVER_NAME = os.getenv("SERVER_NAME", "Main Server")
 MAIN_GUILD_ID = int(
     os.getenv(
         "MAIN_GUILD_ID",
-        os.getenv("GUILD_ID", os.getenv("VESTIGE_GUILD_ID", "0")),
+        os.getenv(
+            "GUILD_ID",
+            os.getenv("VESTIGE_GUILD_ID", "1539760704641437837"),
+        ),
     )
 )
 MAX_MEMBERS = int(os.getenv("MAX_MEMBERS", "200"))
 INVITE_EXPIRY_DAYS = int(os.getenv("INVITE_EXPIRY_DAYS", "7"))
+RCE_SERVER_ID = os.getenv("RCE_SERVER_ID", "").strip()
+RCE_SERVER_NAME = os.getenv("RCE_SERVER_NAME", "").strip()
+AUTO_REGISTER_CLANS = os.getenv("AUTO_REGISTER_CLANS", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
 
 
 def schema_unavailable_embed(bot: commands.Bot) -> discord.Embed:
@@ -73,6 +83,44 @@ def success_embed(title: str, description: str) -> discord.Embed:
         color=THEME_COLOR,
         timestamp=discord.utils.utcnow(),
     )
+
+
+def _normalize_name(value: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", value.lower())
+
+
+def derive_clan_identity(role_name: str, source_guild_name: str) -> tuple[str, str]:
+    """Turn common Discord role names into a stable clan name and tag."""
+    clean = re.sub(r"\s+", " ", role_name).strip()
+    match = re.match(
+        r"^\[([A-Za-z0-9]{2,8})\]\s*(?:[-|:·—]\s*)?(.+)$",
+        clean,
+    )
+    if not match:
+        match = re.match(
+            r"^([A-Za-z0-9]{2,8})\s+[-|:·—]\s*(.+)$",
+            clean,
+        )
+    if match and match.group(2).strip():
+        tag = match.group(1).upper()
+        name = match.group(2).strip()
+    else:
+        name = clean or source_guild_name.strip() or "Unnamed Clan"
+        words = re.findall(r"[A-Za-z0-9]+", name)
+        tag = "".join(word[0] for word in words)[:4].upper()
+        if len(tag) < 2:
+            tag = re.sub(r"[^A-Za-z0-9]", "", name)[:4].upper() or "CLAN"
+    return name[:100], tag[:16]
+
+
+def _eligible_roles(member: discord.Member) -> list[discord.Role]:
+    return [
+        role
+        for role in member.roles
+        if role != member.guild.default_role
+        and not role.managed
+        and not role.is_bot_managed()
+    ]
 
 
 async def get_guild_link(guild_id: int) -> Optional[int]:
@@ -305,6 +353,11 @@ class InviteView(discord.ui.View):
             "UPDATE clan_invites SET status='accepted', responded_at=? WHERE id=?",
             (int(time.time()), self.invite_id),
         )
+        rce_synced = await self.cog.sync_member_to_rce(
+            int(clan["id"]),
+            member.id,
+            "member",
+        )
 
         team_chat = (
             guild.get_channel(int(clan["channel_id"]))
@@ -317,7 +370,13 @@ class InviteView(discord.ui.View):
                     embed=success_embed(
                         "New member",
                         f"Welcome to **{clan['name']}**, {member.mention}!\n"
-                        "They accepted their clan invite.",
+                        "They accepted their clan invite and were added via Roster Bot."
+                        + (
+                            ""
+                            if rce_synced
+                            else "\n\n⚠️ The RCE bot database could not be reached; "
+                            "an administrator should run a roster sync."
+                        ),
                     )
                 )
             except discord.HTTPException:
@@ -374,12 +433,184 @@ class RecruitCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
+    async def sync_clans_from_rce(self) -> None:
+        sync = getattr(self.bot, "rce_sync", None)
+        if sync and sync.enabled:
+            await sync.pull_clans(MAIN_GUILD_ID)
+
+    async def sync_member_to_rce(self, clan_id: int, user_id: int, clan_role: str = "member") -> bool:
+        sync = getattr(self.bot, "rce_sync", None)
+        if not sync or not sync.enabled:
+            return True
+        return await sync.upsert_member(
+            clan_id=clan_id,
+            user_id=user_id,
+            clan_role=clan_role,
+        )
+
+    async def _choose_source_role(
+        self,
+        source_member: discord.Member,
+        main_member: discord.Member,
+        requested_role: Optional[discord.Role],
+    ) -> tuple[Optional[discord.Role], Optional[str]]:
+        if requested_role:
+            if requested_role not in source_member.roles:
+                return None, "You must hold the roster role you select."
+            return requested_role, None
+
+        source_roles = _eligible_roles(source_member)
+        if not source_roles:
+            return None, "You do not have a roster/clan role in this server."
+
+        # Prefer a source role whose name also appears on the member in the
+        # main server. This is the common two-server setup.
+        main_names = {_normalize_name(role.name) for role in _eligible_roles(main_member)}
+        matching = [role for role in source_roles if _normalize_name(role.name) in main_names]
+        if len(matching) == 1:
+            return matching[0], None
+        if len(source_roles) == 1:
+            return source_roles[0], None
+        if len(matching) > 1:
+            source_roles = matching
+
+        choices = ", ".join(role.mention for role in source_roles[:10])
+        return None, (
+            "I found more than one role you hold. Run `/clan recruit` again and "
+            f"choose the clan role explicitly: {choices}"
+        )
+
+    async def _auto_register_clan(
+        self,
+        *,
+        source_guild: discord.Guild,
+        source_role: discord.Role,
+        main_guild: discord.Guild,
+        main_member: discord.Member,
+    ):
+        """Create the clan record from the role when RCE has no record yet."""
+        if not AUTO_REGISTER_CLANS:
+            return None, "Automatic clan registration is disabled."
+
+        name, tag = derive_clan_identity(source_role.name, source_guild.name)
+        main_roles = _eligible_roles(main_member)
+        source_name = _normalize_name(source_role.name)
+        exact_roles = [
+            role for role in main_roles if _normalize_name(role.name) == source_name
+        ]
+        related_roles = [
+            role
+            for role in main_roles
+            if source_name
+            and (
+                source_name in _normalize_name(role.name)
+                or _normalize_name(role.name) in source_name
+            )
+        ]
+        main_role = (
+            exact_roles[0]
+            if len(exact_roles) == 1
+            else related_roles[0]
+            if len(related_roles) == 1
+            else None
+        )
+        if main_role is None:
+            return None, (
+                f"I could not match **{source_role.name}** to a clan role in "
+                f"**{SERVER_NAME}**. The role names need to match, or an RCE clan "
+                "record must already exist."
+            )
+
+        # RCE-created roles commonly use the format "Clan Name [TAG]". Prefer
+        # that source of truth when the role supplies an explicit tag.
+        if "[" in main_role.name or "]" in main_role.name:
+            name, tag = derive_clan_identity(main_role.name, source_guild.name)
+
+        matching_channels = [
+            channel
+            for channel in main_guild.text_channels
+            if _normalize_name(channel.name)
+            in {_normalize_name(name), _normalize_name(source_role.name)}
+        ]
+        channel = matching_channels[0] if len(matching_channels) == 1 else None
+        payload = {
+            "guild_id": main_guild.id,
+            "server_id": RCE_SERVER_ID or "default",
+            "server_name": RCE_SERVER_NAME,
+            "name": name,
+            "clantag": tag,
+            "owner_id": main_member.id,
+            "role_id": main_role.id,
+            "channel_id": channel.id if channel else None,
+            "description": f"Automatically registered from roster role {source_role.name}.",
+        }
+
+        sync = getattr(self.bot, "rce_sync", None)
+        if sync and sync.enabled:
+            clan = await sync.upsert_clan(payload)
+            if clan:
+                return clan, None
+            return None, (
+                "I could not sync the automatically detected clan to the RCE bot. "
+                "Check RCE_SYNC_URL, RCE_SYNC_TOKEN, and the RCE service logs."
+            )
+
+        existing = await fetchone(
+            """
+            SELECT * FROM clans
+            WHERE guild_id=? AND (role_id=? OR LOWER(name)=LOWER(?) OR LOWER(clantag)=LOWER(?))
+            LIMIT 1
+            """,
+            (main_guild.id, main_role.id, name, tag),
+        )
+        if existing:
+            return existing, None
+
+        try:
+            await execute(
+                """
+                INSERT INTO clans (
+                    guild_id, server_id, name, clantag, color, description,
+                    owner_id, role_id, channel_id, created_at
+                ) VALUES (?, ?, ?, ?, '#ffffff', ?, ?, ?, ?, ?)
+                """,
+                (
+                    main_guild.id,
+                    RCE_SERVER_ID or "default",
+                    name,
+                    tag,
+                    payload["description"],
+                    main_member.id,
+                    main_role.id,
+                    channel.id if channel else None,
+                    int(time.time()),
+                ),
+            )
+        except Exception as exc:
+            log.exception("Automatic local clan registration failed")
+            return None, f"Automatic clan registration failed: `{type(exc).__name__}`"
+
+        clan = await fetchone(
+            "SELECT * FROM clans WHERE guild_id=? AND role_id=? LIMIT 1",
+            (main_guild.id, main_role.id),
+        )
+        if clan:
+            await execute(
+                """
+                INSERT OR IGNORE INTO clan_members (clan_id, user_id, clan_role, joined_at)
+                VALUES (?, ?, 'owner', ?)
+                """,
+                (int(clan["id"]), main_member.id, int(time.time())),
+            )
+        return clan, None
+
     async def _find_clan(
         self,
         source_guild: discord.Guild,
         runner: discord.Member,
         main_guild: discord.Guild,
         clan_name: Optional[str],
+        source_role: discord.Role,
     ):
         if clan_name:
             normalized = clan_name.strip().lower()
@@ -432,7 +663,7 @@ class RecruitCog(commands.Cog):
             if len(candidates) == 1:
                 clan, role = candidates[0]
             elif len(candidates) > 1:
-                normalize = lambda value: re.sub(r"[^a-z0-9]", "", value.lower())
+                normalize = _normalize_name
                 source_name = normalize(source_guild.name)
                 matching = [
                     pair
@@ -454,11 +685,21 @@ class RecruitCog(commands.Cog):
                     )
 
         if clan is None:
-            return (
-                None,
-                None,
-                "I could not find your clan. You must own, co-lead, or hold the "
-                "registered clan role on the main server.",
+            clan, problem = await self._auto_register_clan(
+                source_guild=source_guild,
+                source_role=source_role,
+                main_guild=main_guild,
+                main_member=runner,
+            )
+            if problem:
+                return None, None, problem
+            if clan:
+                role = main_guild.get_role(int(clan["role_id"])) if clan["role_id"] else None
+
+        if clan is None:
+            return None, None, (
+                "I could not find or register your clan. Hold the matching clan role "
+                f"in **{SERVER_NAME}** and try again."
             )
 
         # An explicit clan name still requires the runner to be an owner,
@@ -483,7 +724,7 @@ class RecruitCog(commands.Cog):
     async def _do_recruit_impl(
         self,
         interaction: discord.Interaction,
-        role: discord.Role,
+        role: Optional[discord.Role],
         clan_name: Optional[str] = None,
     ) -> None:
         if not interaction.guild or not isinstance(interaction.user, discord.Member):
@@ -502,7 +743,7 @@ class RecruitCog(commands.Cog):
 
         await interaction.response.defer()
         progress = await interaction.followup.send(
-            f"Checking **{role.name}** and preparing invitations…",
+            "Detecting your clan role and preparing invitations…",
             wait=True,
         )
         main_guild = self.bot.get_guild(MAIN_GUILD_ID)
@@ -514,6 +755,8 @@ class RecruitCog(commands.Cog):
                     "and that Server Members Intent is enabled.",
                 )
             )
+
+        await self.sync_clans_from_rce()
 
         runner = main_guild.get_member(interaction.user.id)
         if runner is None:
@@ -529,8 +772,18 @@ class RecruitCog(commands.Cog):
                 )
             )
 
+        role, role_problem = await self._choose_source_role(
+            interaction.user,
+            runner,
+            role,
+        )
+        if role_problem or role is None:
+            return await interaction.followup.send(
+                embed=error_embed("Cannot determine roster role", role_problem or "No role found.")
+            )
+
         clan, clan_role, problem = await self._find_clan(
-            interaction.guild, runner, main_guild, clan_name
+            interaction.guild, runner, main_guild, clan_name, role
         )
         if problem or clan is None:
             return await interaction.followup.send(embed=error_embed("Cannot recruit", problem or "No clan found."))
@@ -745,20 +998,22 @@ async def setup(bot: commands.Bot) -> None:
 
     async def recruit_callback(
         interaction: discord.Interaction,
-        role: discord.Role,
+        role: Optional[discord.Role] = None,
         clan_name: Optional[str] = None,
     ) -> None:
         await cog.do_recruit(interaction, role, clan_name)
 
-    command = app_commands.Command(
-        name="recruit",
-        description="DM main-server members an invitation to join your clan.",
-        callback=recruit_callback,
-    )
-    app_commands.describe(
-        role="Role whose members should receive a clan invitation",
-        clan_name="Optional clan name or tag when automatic detection is ambiguous",
-    )(command)
+    def make_recruit_command() -> app_commands.Command:
+        command = app_commands.Command(
+            name="recruit",
+            description="DM main-server members an invitation to join your clan.",
+            callback=recruit_callback,
+        )
+        app_commands.describe(
+            role="Optional roster role (auto-detected from the role you hold)",
+            clan_name="Optional clan name or tag when automatic detection is ambiguous",
+        )(command)
+        return command
 
     existing = bot.tree.get_command("clan")
     if isinstance(existing, app_commands.Group):
@@ -766,6 +1021,7 @@ async def setup(bot: commands.Bot) -> None:
     else:
         group = app_commands.Group(name="clan", description="Clan operations")
         bot.tree.add_command(group)
+    group.add_command(make_recruit_command())
 
     async def register_callback(
         interaction: discord.Interaction,
@@ -860,11 +1116,22 @@ async def setup(bot: commands.Bot) -> None:
         description="Optional clan description",
     )(register_command)
     app_commands.default_permissions(administrator=True)(register_command)
-    group.add_command(command)
-    group.add_command(register_command)
+
+    # Keep the recovery/admin command out of roster servers. A separate guild
+    # scoped copy of the group gives the main guild both subcommands while the
+    # global copy exposes only /clan recruit elsewhere.
+    main_group = app_commands.Group(name="clan", description="Clan operations")
+    main_group.add_command(make_recruit_command())
+    main_group.add_command(register_command)
+    bot.tree.add_command(
+        main_group,
+        guild=discord.Object(id=MAIN_GUILD_ID),
+        override=True,
+    )
 
 
 async def teardown(bot: commands.Bot) -> None:
     group = bot.tree.get_command("clan")
     if isinstance(group, app_commands.Group):
         group.remove_command("recruit")
+    bot.tree.remove_command("clan", guild=discord.Object(id=MAIN_GUILD_ID))
