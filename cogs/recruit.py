@@ -29,7 +29,7 @@ MAIN_GUILD_ID = int(
     )
 )
 MAX_MEMBERS = int(os.getenv("MAX_MEMBERS", "200"))
-INVITE_EXPIRY_DAYS = int(os.getenv("INVITE_EXPIRY_DAYS", "7"))
+INVITE_EXPIRY_HOURS = 24
 RCE_SERVER_ID = os.getenv("RCE_SERVER_ID", "").strip()
 RCE_SERVER_NAME = os.getenv("RCE_SERVER_NAME", "").strip()
 AUTO_REGISTER_CLANS = os.getenv("AUTO_REGISTER_CLANS", "1").strip().lower() not in {
@@ -92,24 +92,32 @@ def _normalize_name(value: str) -> str:
 def derive_clan_identity(role_name: str, source_guild_name: str) -> tuple[str, str]:
     """Turn common Discord role names into a stable clan name and tag."""
     clean = re.sub(r"\s+", " ", role_name).strip()
-    match = re.match(
-        r"^\[([A-Za-z0-9]{2,8})\]\s*(?:[-|:·—]\s*)?(.+)$",
+    suffix_match = re.match(
+        r"^(.+?)\s+\[([A-Za-z0-9]{1,4})\]$",
         clean,
     )
-    if not match:
+    if suffix_match:
+        name = suffix_match.group(1).strip()
+        tag = suffix_match.group(2).upper()
+    else:
         match = re.match(
-            r"^([A-Za-z0-9]{2,8})\s+[-|:·—]\s*(.+)$",
+            r"^\[([A-Za-z0-9]{2,8})\]\s*(?:[-|:·—]\s*)?(.+)$",
             clean,
         )
-    if match and match.group(2).strip():
-        tag = match.group(1).upper()
-        name = match.group(2).strip()
-    else:
-        name = clean or source_guild_name.strip() or "Unnamed Clan"
-        words = re.findall(r"[A-Za-z0-9]+", name)
-        tag = "".join(word[0] for word in words)[:4].upper()
-        if len(tag) < 2:
-            tag = re.sub(r"[^A-Za-z0-9]", "", name)[:4].upper() or "CLAN"
+        if not match:
+            match = re.match(
+                r"^([A-Za-z0-9]{2,8})\s+[-|:·—]\s*(.+)$",
+                clean,
+            )
+        if match and match.group(2).strip():
+            tag = match.group(1).upper()
+            name = match.group(2).strip()
+        else:
+            name = clean or source_guild_name.strip() or "Unnamed Clan"
+            words = re.findall(r"[A-Za-z0-9]+", name)
+            tag = "".join(word[0] for word in words)[:4].upper()
+            if len(tag) < 2:
+                tag = re.sub(r"[^A-Za-z0-9]", "", name)[:4].upper() or "CLAN"
     return name[:100], tag[:16]
 
 
@@ -324,7 +332,7 @@ class InviteView(discord.ui.View):
             return await interaction.response.send_message(
                 f"This invite has already been {invite['status']}."
             )
-        if int(invite["created_at"]) + INVITE_EXPIRY_DAYS * 86400 < int(time.time()):
+        if int(invite["created_at"]) + INVITE_EXPIRY_HOURS * 3600 < int(time.time()):
             await execute(
                 "UPDATE clan_invites SET status='expired', responded_at=? WHERE id=?",
                 (int(time.time()), self.invite_id),
@@ -409,12 +417,14 @@ class InviteView(discord.ui.View):
             else None
         )
         if team_chat and isinstance(team_chat, discord.abc.Messageable):
+            inviter_mention = f"<@{int(invite['invited_by_id'])}>"
             try:
                 await team_chat.send(
                     embed=success_embed(
-                        "New member",
-                        f"Welcome to **{clan['name']}**, {member.mention}!\n"
-                        "They accepted their clan invite and were added via Roster Bot."
+                        "✅ New Clan Member",
+                        f"{member.mention} has been added to "
+                        f"**{clan['name']} [{clan['clantag']}]** via **Roster Bot**.\n\n"
+                        f"**Invited by:** {inviter_mention}"
                         + (
                             ""
                             if rce_synced
@@ -428,7 +438,8 @@ class InviteView(discord.ui.View):
 
         await update_active_clans(guild, guild.id, str(clan["server_id"]))
         await interaction.response.send_message(
-            f"You joined **[{clan['clantag']}] {clan['name']}**."
+            f"✅ You have been added to the **[{clan['clantag']}] {clan['name']}** "
+            "team via **Roster Bot**."
         )
         if interaction.message:
             await interaction.message.edit(
@@ -1264,16 +1275,34 @@ class RecruitCog(commands.Cog):
                 source_role_id=role.id,
             )
             invite_embed = discord.Embed(
-                title=f"Clan invitation · [{clan['clantag']}] {clan['name']}",
+                title="🎮 Clan Team Invitation",
                 description=(
-                    f"**{interaction.user.display_name}** invited you to join "
-                    f"**{clan['name']}**.\n\n"
-                    f"You are already a member of **{SERVER_NAME}**. "
-                    "Choose **Accept invite** to join the clan, or **Decline** to dismiss it."
+                    f"You've been invited to join the **{clan['name']} "
+                    f"[{clan['clantag']}]** team through **Roster Bot**."
                 ),
                 color=THEME_COLOR,
+                timestamp=discord.utils.utcnow(),
             )
-            invite_embed.set_footer(text=f"Invite expires in {INVITE_EXPIRY_DAYS} days")
+            invite_embed.add_field(
+                name="What happens when you accept?",
+                value=(
+                    f"Roster Bot will add you to the **{clan['name']} "
+                    f"[{clan['clantag']}]** team and assign the clan role in "
+                    f"**{SERVER_NAME}**."
+                ),
+                inline=False,
+            )
+            invite_embed.add_field(
+                name="⏳ Expires",
+                value="This invitation is valid for **24 hours**.",
+                inline=True,
+            )
+            invite_embed.add_field(
+                name="🔐 Private invitation",
+                value="Only you can accept this invite.",
+                inline=True,
+            )
+            invite_embed.set_footer(text="Roster Bot • Choose an option below")
             try:
                 message = await asyncio.wait_for(
                     main_member.send(
