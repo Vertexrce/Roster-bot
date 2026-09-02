@@ -197,6 +197,32 @@ async def clear_local_clans(guild_id: int) -> int:
     return len(clan_ids)
 
 
+async def purge_missing_clan_records(guild: discord.Guild) -> None:
+    """Remove local registrations whose main-server clan role was deleted."""
+    rows = await fetchall(
+        "SELECT id, role_id FROM clans WHERE guild_id=?",
+        (guild.id,),
+    )
+    for row in rows:
+        role_id = int(row["role_id"]) if row["role_id"] else 0
+        if role_id and guild.get_role(role_id):
+            continue
+
+        clan_id = int(row["id"])
+        await execute(
+            "DELETE FROM roster_clan_registrations WHERE clan_id=?",
+            (clan_id,),
+        )
+        await execute("DELETE FROM clan_invites WHERE clan_id=?", (clan_id,))
+        await execute("DELETE FROM clan_members WHERE clan_id=?", (clan_id,))
+        if role_id:
+            await execute(
+                "DELETE FROM guild_clan_link WHERE clan_role_id=?",
+                (role_id,),
+            )
+        await execute("DELETE FROM clans WHERE id=?", (clan_id,))
+
+
 async def get_clan_by_role(role_id: int):
     return await fetchone("SELECT * FROM clans WHERE role_id=?", (role_id,))
 
@@ -698,6 +724,7 @@ class RecruitCog(commands.Cog):
         member: discord.Member,
     ) -> tuple[Optional[object], Optional[discord.Role], Optional[str]]:
         """Find the leader's clan and repair a stale Discord role ID if needed."""
+        await purge_missing_clan_records(member.guild)
         rows = await fetchall(
             """
             SELECT * FROM clans
@@ -784,9 +811,9 @@ class RecruitCog(commands.Cog):
             return (
                 None,
                 None,
-                "I could not find an RCE clan role on you in the main server. "
-                "Clan roles created by the clans cog use the format "
-                "`Clan Name [TAG]`.",
+                "I could not find your clan role. Make sure you have made a "
+                "clan and that you are the clan leader or a co-leader, then "
+                "try again.",
             )
         if len(matches) > 1:
             return (
@@ -1017,6 +1044,7 @@ class RecruitCog(commands.Cog):
         clan_name: Optional[str],
         source_role: discord.Role,
     ):
+        await purge_missing_clan_records(main_guild)
         if clan_name:
             normalized = clan_name.strip().lower()
             clan = await fetchone(
@@ -1033,16 +1061,6 @@ class RecruitCog(commands.Cog):
 
         clan = None
         role = None
-
-        cached_role_id = await get_guild_link(source_guild.id)
-        if cached_role_id:
-            role = main_guild.get_role(cached_role_id)
-            if role is None:
-                await clear_guild_link(source_guild.id)
-            else:
-                clan = await get_clan_by_role(cached_role_id)
-                if clan and int(clan["guild_id"]) != main_guild.id:
-                    clan = None
 
         if clan is None:
             clan = await get_owned_clan(main_guild.id, runner.id)
@@ -1125,7 +1143,11 @@ class RecruitCog(commands.Cog):
         if not authorized and role:
             authorized = role.id in {item.id for item in runner.roles}
         if not authorized:
-            return None, None, "Only the clan owner, a co-leader, or a clan role holder can recruit."
+            return None, None, (
+                "Only the clan owner, a co-leader, or someone holding that "
+                "clan's registered role can recruit. The clan owner must run "
+                "`/clan register` in the main server first."
+            )
 
         return clan, role, None
 
