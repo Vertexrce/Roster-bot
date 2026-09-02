@@ -125,6 +125,14 @@ async def init_db() -> None:
                 linked_at    INTEGER NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS roster_clan_registrations (
+                clan_id       INTEGER PRIMARY KEY,
+                guild_id      INTEGER NOT NULL,
+                role_id       INTEGER NOT NULL,
+                registered_by INTEGER NOT NULL,
+                registered_at INTEGER NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS clan_invites (
                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
                 clan_id          INTEGER NOT NULL,
