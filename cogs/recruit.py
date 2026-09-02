@@ -687,6 +687,10 @@ class RecruitCog(commands.Cog):
                 raise RuntimeError(
                     "The RCE sync service did not confirm the clan records were cleared."
                 )
+        await execute(
+            "DELETE FROM roster_clan_registrations WHERE guild_id=?",
+            (guild_id,),
+        )
         return await clear_local_clans(guild_id)
 
     async def find_leader_clan(
@@ -1086,21 +1090,24 @@ class RecruitCog(commands.Cog):
                     )
 
         if clan is None:
-            clan, problem = await self._auto_register_clan(
-                source_guild=source_guild,
-                source_role=source_role,
-                main_guild=main_guild,
-                main_member=runner,
-            )
-            if problem:
-                return None, None, problem
-            if clan:
-                role = main_guild.get_role(int(clan["role_id"])) if clan["role_id"] else None
-
-        if clan is None:
             return None, None, (
-                "I could not find or register your clan. Hold the matching clan role "
-                f"in **{SERVER_NAME}** and try again."
+                "Your clan has not been registered for roster recruitment yet. "
+                f"The clan owner must run `/clan register` in **{SERVER_NAME}** "
+                "before anyone can use recruitment."
+            )
+
+        registration = await fetchone(
+            """
+            SELECT clan_id FROM roster_clan_registrations
+            WHERE clan_id=? AND guild_id=?
+            """,
+            (int(clan["id"]), main_guild.id),
+        )
+        if not registration:
+            return None, None, (
+                f"**{clan['name']} [{clan['clantag']}]** is not registered for "
+                f"roster recruitment. The clan owner must run `/clan register` "
+                f"in **{SERVER_NAME}** first."
             )
 
         # An explicit clan name still requires the runner to be an owner,
@@ -1471,6 +1478,20 @@ async def setup(bot: commands.Bot) -> None:
             VALUES (?, ?, 'owner', ?)
             """,
             (int(clan["id"]), interaction.user.id, int(time.time())),
+        )
+        await execute(
+            """
+            INSERT OR REPLACE INTO roster_clan_registrations
+                (clan_id, guild_id, role_id, registered_by, registered_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                int(clan["id"]),
+                MAIN_GUILD_ID,
+                int(role.id),
+                interaction.user.id,
+                int(time.time()),
+            ),
         )
         role_text = role.mention if role else f"<@&{clan['role_id']}>"
         await interaction.response.send_message(
