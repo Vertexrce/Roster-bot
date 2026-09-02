@@ -546,6 +546,123 @@ class RecruitCog(commands.Cog):
             clan_role=clan_role,
         )
 
+    async def _register_clan_from_main_role(
+        self,
+        member: discord.Member,
+        role: discord.Role,
+    ) -> tuple[Optional[object], Optional[str]]:
+        """Create a local clan from the leader's exact main-server role.
+
+        The bridge is preferred when configured so separate services share the
+        RCE clan ID. A bridge outage must not block registration in the roster
+        bot, which can continue using its compatible local clan table.
+        """
+        name, tag = derive_clan_identity(role.name, member.guild.name)
+        matching_channels = [
+            channel
+            for channel in member.guild.text_channels
+            if _normalize_name(channel.name)
+            in {_normalize_name(name), _normalize_name(role.name)}
+        ]
+        payload = {
+            "guild_id": MAIN_GUILD_ID,
+            "server_id": RCE_SERVER_ID or "default",
+            "server_name": RCE_SERVER_NAME,
+            "name": name,
+            "clantag": tag,
+            "owner_id": member.id,
+            "role_id": role.id,
+            "channel_id": (
+                matching_channels[0].id
+                if len(matching_channels) == 1
+                else None
+            ),
+            "description": f"Registered from main-server role {role.name}.",
+        }
+
+        sync = getattr(self.bot, "rce_sync", None)
+        if sync and sync.enabled:
+            clan = await sync.upsert_clan(payload)
+            if clan:
+                return clan, None
+            log.warning(
+                "RCE clan registration was unavailable for role %s; "
+                "falling back to the roster database",
+                role.id,
+            )
+
+        existing = await fetchone(
+            """
+            SELECT * FROM clans
+            WHERE guild_id=?
+              AND (role_id=? OR LOWER(name)=LOWER(?) OR LOWER(clantag)=LOWER(?))
+            LIMIT 1
+            """,
+            (MAIN_GUILD_ID, role.id, name, tag),
+        )
+        if existing:
+            await execute(
+                """
+                UPDATE clans
+                SET role_id=?, owner_id=?,
+                    channel_id=COALESCE(?, channel_id),
+                    description=COALESCE(?, description)
+                WHERE id=?
+                """,
+                (
+                    role.id,
+                    member.id,
+                    payload["channel_id"],
+                    payload["description"],
+                    int(existing["id"]),
+                ),
+            )
+            clan = await fetchone(
+                "SELECT * FROM clans WHERE id=?",
+                (int(existing["id"]),),
+            )
+        else:
+            try:
+                await execute(
+                    """
+                    INSERT INTO clans (
+                        guild_id, server_id, name, clantag, color, description,
+                        owner_id, role_id, channel_id, created_at
+                    ) VALUES (?, ?, ?, ?, '#ffffff', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        MAIN_GUILD_ID,
+                        payload["server_id"],
+                        name,
+                        tag,
+                        payload["description"],
+                        member.id,
+                        role.id,
+                        payload["channel_id"],
+                        int(time.time()),
+                    ),
+                )
+            except Exception as exc:
+                log.exception("Main-server role clan registration failed")
+                return None, f"Clan registration failed: `{type(exc).__name__}`"
+            clan = await fetchone(
+                "SELECT * FROM clans WHERE guild_id=? AND role_id=? LIMIT 1",
+                (MAIN_GUILD_ID, role.id),
+            )
+
+        if not clan:
+            return None, "The clan record could not be created in the roster database."
+
+        await execute(
+            """
+            INSERT OR IGNORE INTO clan_members
+                (clan_id, user_id, clan_role, joined_at)
+            VALUES (?, ?, 'owner', ?)
+            """,
+            (int(clan["id"]), member.id, int(time.time())),
+        )
+        return clan, None
+
     async def unregister_all_clans(self, guild_id: int) -> int:
         """Clear the RCE source first, then clear this bot's mirror."""
         sync = getattr(self.bot, "rce_sync", None)
@@ -613,12 +730,41 @@ class RecruitCog(commands.Cog):
                 if len(named_roles) == 1 or len(eligible_roles) == 1:
                     matches = [clan]
 
+        # A leader can register a new clan even when other clans already
+        # exist. Exclude known clan roles first, then require one unambiguous
+        # new role so ordinary Discord roles cannot be registered accidentally.
+        known_role_ids = {
+            int(row["role_id"])
+            for row in rows
+            if row["role_id"] is not None
+        }
+        unregistered_roles = [
+            role
+            for role in eligible_roles
+            if role.id not in known_role_ids
+            and not any(role_name_matches(role, row) for row in rows)
+        ]
+        if not matches and len(unregistered_roles) == 1:
+            role = unregistered_roles[0]
+            clan, problem = await self._register_clan_from_main_role(member, role)
+            if clan:
+                return clan, role, None
+            return None, None, problem
+        if not matches and len(unregistered_roles) > 1:
+            return (
+                None,
+                None,
+                "I found more than one unregistered role on you. Remove your "
+                "extra roles so only your clan role remains, then run "
+                "`/clan register` again.",
+            )
+
         if not matches:
             return (
                 None,
                 None,
-                "I could not find a synced clan role on you in the main server. "
-                "Make sure the RCE bot has synced this clan first.",
+                "I could not find an unregistered clan role on you in the main "
+                "server. Make sure you hold your clan role, then try again.",
             )
         if len(matches) > 1:
             return (
@@ -1257,7 +1403,7 @@ async def setup(bot: commands.Bot) -> None:
     async def register_callback(
         interaction: discord.Interaction,
     ) -> None:
-        """Register the one synced clan role held by the clan leader."""
+        """Register the clan role held by a leader in the main server."""
         if interaction.guild is None or interaction.guild.id != MAIN_GUILD_ID:
             return await interaction.response.send_message(
                 "This command must be used in the configured main server.",
@@ -1269,7 +1415,8 @@ async def setup(bot: commands.Bot) -> None:
                 ephemeral=True,
             )
 
-        # Pull the current RCE records before checking the member's roles.
+        # Pull known records when possible, but do not require the RCE database
+        # to already contain this clan. find_leader_clan can create it locally.
         await cog.sync_clans_from_rce()
         clan, role, problem = await cog.find_leader_clan(interaction.user)
         if problem or clan is None:
@@ -1299,7 +1446,7 @@ async def setup(bot: commands.Bot) -> None:
 
     register_command = app_commands.Command(
         name="register",
-        description="Register your synced clan automatically.",
+        description="Register your main-server clan role for recruitment.",
         callback=register_callback,
     )
 
