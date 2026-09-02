@@ -560,7 +560,7 @@ class RecruitCog(commands.Cog):
         self,
         member: discord.Member,
     ) -> tuple[Optional[object], Optional[discord.Role], Optional[str]]:
-        """Find exactly one synced clan matching the leader's main-server role."""
+        """Find the leader's clan and repair a stale Discord role ID if needed."""
         rows = await fetchall(
             """
             SELECT * FROM clans
@@ -570,10 +570,49 @@ class RecruitCog(commands.Cog):
             (MAIN_GUILD_ID,),
         )
         member_role_ids = {role.id for role in member.roles}
+        eligible_roles = _eligible_roles(member)
+
+        def role_name_matches(role: discord.Role, clan: object) -> bool:
+            role_name = _normalize_name(role.name)
+            clan_name = _normalize_name(str(clan["name"]))
+            clan_tag = _normalize_name(str(clan["clantag"]))
+            return role_name in {
+                clan_name,
+                clan_tag,
+                _normalize_name(f"{clan['name']} {clan['clantag']}"),
+                _normalize_name(f"{clan['name']} [{clan['clantag']}]"),
+                _normalize_name(f"[{clan['clantag']}] {clan['name']}"),
+            }
+
         matches = [
             row for row in rows
             if int(row["role_id"]) in member_role_ids
         ]
+
+        # If a Discord role was recreated, its ID changes even though its
+        # visible name is still the clan's standard "Name [TAG]" format.
+        if not matches:
+            matches = [
+                row for row in rows
+                if any(role_name_matches(role, row) for role in eligible_roles)
+            ]
+
+        # The owner record is a reliable fallback when the old role ID is
+        # stale or missing from the RCE database.
+        if not matches:
+            owner_matches = [
+                row for row in rows
+                if int(row["owner_id"]) == member.id
+            ]
+            if len(owner_matches) == 1:
+                clan = owner_matches[0]
+                named_roles = [
+                    role for role in eligible_roles
+                    if role_name_matches(role, clan)
+                ]
+                if len(named_roles) == 1 or len(eligible_roles) == 1:
+                    matches = [clan]
+
         if not matches:
             return (
                 None,
@@ -596,7 +635,54 @@ class RecruitCog(commands.Cog):
                 None,
                 "Only the registered clan leader can use `/clan register`.",
             )
-        role = member.guild.get_role(int(clan["role_id"]))
+
+        role = None
+        if clan["role_id"] and int(clan["role_id"]) in member_role_ids:
+            role = member.guild.get_role(int(clan["role_id"]))
+        if role is None:
+            named_roles = [
+                item for item in eligible_roles
+                if role_name_matches(item, clan)
+            ]
+            if len(named_roles) == 1:
+                role = named_roles[0]
+            elif len(eligible_roles) == 1:
+                role = eligible_roles[0]
+
+        if role is None:
+            return (
+                None,
+                None,
+                "I found your clan leader record, but the saved clan role does "
+                "not match a role you currently hold. Re-add the clan role, "
+                "then run `/clan register` again.",
+            )
+
+        # Save the current role ID locally and through the bridge so future
+        # accepted invitations receive this exact role.
+        if not clan["role_id"] or int(clan["role_id"]) != role.id:
+            await execute(
+                "UPDATE clans SET role_id=? WHERE id=?",
+                (role.id, int(clan["id"])),
+            )
+            sync = getattr(self.bot, "rce_sync", None)
+            if sync and sync.enabled:
+                repaired = await sync.upsert_clan(
+                    {
+                        "guild_id": int(clan["guild_id"]),
+                        "server_id": str(clan["server_id"]),
+                        "server_name": RCE_SERVER_NAME,
+                        "name": str(clan["name"]),
+                        "clantag": str(clan["clantag"]),
+                        "owner_id": int(clan["owner_id"]),
+                        "role_id": role.id,
+                        "channel_id": clan["channel_id"],
+                        "description": clan["description"],
+                    }
+                )
+                if repaired:
+                    clan = repaired
+
         return clan, role, None
 
     async def _choose_source_role(
