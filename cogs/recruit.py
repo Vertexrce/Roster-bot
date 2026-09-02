@@ -1388,13 +1388,17 @@ async def setup(bot: commands.Bot) -> None:
 
     async def recruit_callback(
         interaction: discord.Interaction,
+        role: discord.Role,
     ) -> None:
-        await cog.do_recruit(interaction, None, None)
+        await cog.do_recruit(interaction, role, None)
 
     def make_recruit_command() -> app_commands.Command:
+        app_commands.describe(
+            role="The roster role whose members should receive invitations.",
+        )(recruit_callback)
         command = app_commands.Command(
             name="recruit",
-            description="Invite your roster members to join your clan.",
+            description="Invite members of a selected roster role to join your clan.",
             callback=recruit_callback,
         )
         return command
