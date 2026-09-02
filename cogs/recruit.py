@@ -113,6 +113,11 @@ def derive_clan_identity(role_name: str, source_guild_name: str) -> tuple[str, s
     return name[:100], tag[:16]
 
 
+def is_rce_clan_role(role_name: str) -> bool:
+    """Return whether a role uses the RCE clans cog's generated format."""
+    return bool(re.match(r"^.+\s+\[[A-Za-z0-9]{1,4}\]$", role_name.strip()))
+
+
 def _eligible_roles(member: discord.Member) -> list[discord.Role]:
     return [
         role
@@ -742,6 +747,7 @@ class RecruitCog(commands.Cog):
             role
             for role in eligible_roles
             if role.id not in known_role_ids
+            and is_rce_clan_role(role.name)
             and not any(role_name_matches(role, row) for row in rows)
         ]
         if not matches and len(unregistered_roles) == 1:
@@ -763,8 +769,9 @@ class RecruitCog(commands.Cog):
             return (
                 None,
                 None,
-                "I could not find an unregistered clan role on you in the main "
-                "server. Make sure you hold your clan role, then try again.",
+                "I could not find an RCE clan role on you in the main server. "
+                "Clan roles created by the clans cog use the format "
+                "`Clan Name [TAG]`.",
             )
         if len(matches) > 1:
             return (
