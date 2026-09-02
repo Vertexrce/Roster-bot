@@ -145,6 +145,45 @@ async def clear_guild_link(guild_id: int) -> None:
     await execute("DELETE FROM guild_clan_link WHERE guild_id=?", (guild_id,))
 
 
+async def clear_local_clans(guild_id: int) -> int:
+    """Delete local registrations without deleting Discord roles or channels."""
+    clans = await fetchall(
+        "SELECT id, role_id FROM clans WHERE guild_id=?",
+        (guild_id,),
+    )
+    clan_ids = [int(row["id"]) for row in clans]
+    role_ids = [int(row["role_id"]) for row in clans if row["role_id"]]
+
+    if clan_ids:
+        placeholders = ",".join("?" for _ in clan_ids)
+        await execute(
+            f"DELETE FROM clan_invites WHERE clan_id IN ({placeholders})",
+            clan_ids,
+        )
+        await execute(
+            f"DELETE FROM clan_invite_codes WHERE clan_id IN ({placeholders})",
+            clan_ids,
+        )
+        await execute(
+            f"DELETE FROM clan_members WHERE clan_id IN ({placeholders})",
+            clan_ids,
+        )
+
+    await execute("DELETE FROM clan_player_stats WHERE guild_id=?", (guild_id,))
+    await execute("DELETE FROM clan_panels WHERE guild_id=?", (guild_id,))
+    await execute("DELETE FROM clan_server_config WHERE guild_id=?", (guild_id,))
+    await execute("DELETE FROM clans WHERE guild_id=?", (guild_id,))
+
+    if role_ids:
+        placeholders = ",".join("?" for _ in role_ids)
+        await execute(
+            f"DELETE FROM guild_clan_link WHERE clan_role_id IN ({placeholders})",
+            role_ids,
+        )
+
+    return len(clan_ids)
+
+
 async def get_clan_by_role(role_id: int):
     return await fetchone("SELECT * FROM clans WHERE role_id=?", (role_id,))
 
@@ -429,6 +468,65 @@ class InviteView(discord.ui.View):
             )
 
 
+class ConfirmUnregisterAllView(discord.ui.View):
+    """One-use confirmation for the administrator-only destructive command."""
+
+    def __init__(self, user_id: int):
+        super().__init__(timeout=60)
+        self.user_id = user_id
+        self.confirmed = False
+
+    async def _check_user(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message(
+                "Only the administrator who started this action can confirm it.",
+                ephemeral=True,
+            )
+            return False
+        return True
+
+    @discord.ui.button(
+        label="Unregister all clans",
+        style=discord.ButtonStyle.danger,
+        emoji="🗑️",
+    )
+    async def confirm(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if not await self._check_user(interaction):
+            return
+        self.confirmed = True
+        self.stop()
+        await interaction.response.edit_message(
+            content="Unregistering all clan records…",
+            embed=None,
+            view=None,
+        )
+
+    @discord.ui.button(
+        label="Cancel",
+        style=discord.ButtonStyle.secondary,
+    )
+    async def cancel(
+        self,
+        interaction: discord.Interaction,
+        button: discord.ui.Button,
+    ) -> None:
+        if not await self._check_user(interaction):
+            return
+        self.stop()
+        await interaction.response.edit_message(
+            content="Cancelled. No clan records were changed.",
+            embed=None,
+            view=None,
+        )
+
+    async def on_timeout(self) -> None:
+        self.stop()
+
+
 class RecruitCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
@@ -447,6 +545,59 @@ class RecruitCog(commands.Cog):
             user_id=user_id,
             clan_role=clan_role,
         )
+
+    async def unregister_all_clans(self, guild_id: int) -> int:
+        """Clear the RCE source first, then clear this bot's mirror."""
+        sync = getattr(self.bot, "rce_sync", None)
+        if sync and sync.enabled:
+            if not await sync.clear_clans(guild_id):
+                raise RuntimeError(
+                    "The RCE sync service did not confirm the clan records were cleared."
+                )
+        return await clear_local_clans(guild_id)
+
+    async def find_leader_clan(
+        self,
+        member: discord.Member,
+    ) -> tuple[Optional[object], Optional[discord.Role], Optional[str]]:
+        """Find exactly one synced clan matching the leader's main-server role."""
+        rows = await fetchall(
+            """
+            SELECT * FROM clans
+            WHERE guild_id=? AND role_id IS NOT NULL
+            ORDER BY id
+            """,
+            (MAIN_GUILD_ID,),
+        )
+        member_role_ids = {role.id for role in member.roles}
+        matches = [
+            row for row in rows
+            if int(row["role_id"]) in member_role_ids
+        ]
+        if not matches:
+            return (
+                None,
+                None,
+                "I could not find a synced clan role on you in the main server. "
+                "Make sure the RCE bot has synced this clan first.",
+            )
+        if len(matches) > 1:
+            return (
+                None,
+                None,
+                "You hold more than one registered clan role. Remove the extra "
+                "clan role before registering.",
+            )
+
+        clan = matches[0]
+        if int(clan["owner_id"]) != member.id:
+            return (
+                None,
+                None,
+                "Only the registered clan leader can use `/clan register`.",
+            )
+        role = member.guild.get_role(int(clan["role_id"]))
+        return clan, role, None
 
     async def _choose_source_role(
         self,
@@ -998,21 +1149,15 @@ async def setup(bot: commands.Bot) -> None:
 
     async def recruit_callback(
         interaction: discord.Interaction,
-        role: Optional[discord.Role] = None,
-        clan_name: Optional[str] = None,
     ) -> None:
-        await cog.do_recruit(interaction, role, clan_name)
+        await cog.do_recruit(interaction, None, None)
 
     def make_recruit_command() -> app_commands.Command:
         command = app_commands.Command(
             name="recruit",
-            description="DM main-server members an invitation to join your clan.",
+            description="Invite your roster members to join your clan.",
             callback=recruit_callback,
         )
-        app_commands.describe(
-            role="Optional roster role (auto-detected from the role you hold)",
-            clan_name="Optional clan name or tag when automatic detection is ambiguous",
-        )(command)
         return command
 
     existing = bot.tree.get_command("clan")
@@ -1025,97 +1170,111 @@ async def setup(bot: commands.Bot) -> None:
 
     async def register_callback(
         interaction: discord.Interaction,
-        name: str,
-        clantag: str,
-        role: discord.Role,
-        server_id: str = "default",
-        description: Optional[str] = None,
     ) -> None:
-        """Recreate a clan record when the original database is unavailable."""
+        """Register the one synced clan role held by the clan leader."""
         if interaction.guild is None or interaction.guild.id != MAIN_GUILD_ID:
             return await interaction.response.send_message(
                 "This command must be used in the configured main server.",
                 ephemeral=True,
             )
-        if not isinstance(interaction.user, discord.Member) or not interaction.user.guild_permissions.administrator:
+        if not isinstance(interaction.user, discord.Member):
             return await interaction.response.send_message(
-                "Only a server administrator can register a clan.",
+                "This command must be used by a clan leader in the main server.",
                 ephemeral=True,
             )
 
-        clean_name = name.strip()
-        clean_tag = clantag.strip()
-        clean_server_id = server_id.strip() or "default"
-        if not clean_name or not clean_tag:
+        # Pull the current RCE records before checking the member's roles.
+        await cog.sync_clans_from_rce()
+        clan, role, problem = await cog.find_leader_clan(interaction.user)
+        if problem or clan is None:
             return await interaction.response.send_message(
-                "Clan name and tag cannot be blank.",
-                ephemeral=True,
-            )
-
-        existing_clan = await fetchone(
-            """
-            SELECT id FROM clans
-            WHERE guild_id=? AND server_id=?
-              AND (LOWER(name)=LOWER(?) OR LOWER(clantag)=LOWER(?))
-            """,
-            (interaction.guild.id, clean_server_id, clean_name, clean_tag),
-        )
-        if existing_clan:
-            return await interaction.response.send_message(
-                "A clan with that name or tag already exists for this server ID.",
+                problem or "I could not determine your clan.",
                 ephemeral=True,
             )
 
         await execute(
             """
-            INSERT INTO clans (
-                guild_id, server_id, name, clantag, color, description,
-                owner_id, role_id, created_at
-            ) VALUES (?, ?, ?, ?, '#ffffff', ?, ?, ?, ?)
+            INSERT OR IGNORE INTO clan_members (clan_id, user_id, clan_role, joined_at)
+            VALUES (?, ?, 'owner', ?)
             """,
-            (
-                interaction.guild.id,
-                clean_server_id,
-                clean_name,
-                clean_tag,
-                description.strip() if description else None,
-                interaction.user.id,
-                role.id,
-                int(time.time()),
-            ),
+            (int(clan["id"]), interaction.user.id, int(time.time())),
         )
-        await execute(
-            """
-            INSERT OR IGNORE INTO clan_server_config (guild_id, server_id)
-            VALUES (?, ?)
-            """,
-            (interaction.guild.id, clean_server_id),
-        )
+        role_text = role.mention if role else f"<@&{clan['role_id']}>"
         await interaction.response.send_message(
             embed=success_embed(
                 "Clan registered",
-                f"**[{clean_tag}] {clean_name}** is ready for recruitment.\n"
-                f"Registered role: {role.mention}\n"
-                f"Server ID: `{clean_server_id}`\n\n"
-                "The administrator who registered it can now run "
-                "`/clan recruit` from a roster server.",
+                f"**[{clan['clantag']}] {clan['name']}** is ready for recruitment.\n"
+                f"Registered role: {role_text}\n\n"
+                "The clan was detected from your main-server role. "
+                "Run `/clan recruit` from your roster server.",
             ),
             ephemeral=True,
         )
 
     register_command = app_commands.Command(
         name="register",
-        description="Register a clan after rebuilding the clan database.",
+        description="Register your synced clan automatically.",
         callback=register_callback,
     )
-    app_commands.describe(
-        name="Display name for the clan",
-        clantag="Short clan tag",
-        role="The main-server role assigned to clan members",
-        server_id="RCE server grouping identifier",
-        description="Optional clan description",
-    )(register_command)
-    app_commands.default_permissions(administrator=True)(register_command)
+
+    async def unregister_all_callback(interaction: discord.Interaction) -> None:
+        if interaction.guild is None or interaction.guild.id != MAIN_GUILD_ID:
+            return await interaction.response.send_message(
+                "This command must be used in the configured main server.",
+                ephemeral=True,
+            )
+        if (
+            not isinstance(interaction.user, discord.Member)
+            or not interaction.user.guild_permissions.administrator
+        ):
+            return await interaction.response.send_message(
+                "Only a server administrator can unregister all clans.",
+                ephemeral=True,
+            )
+
+        view = ConfirmUnregisterAllView(interaction.user.id)
+        await interaction.response.send_message(
+            embed=error_embed(
+                "Unregister all clans?",
+                "This removes every clan registration, membership record, "
+                "invite, and roster sync record from the databases.\n\n"
+                "**Discord roles and channels will not be deleted.**",
+            ),
+            view=view,
+            ephemeral=True,
+        )
+        await view.wait()
+        if not view.confirmed:
+            return
+
+        try:
+            deleted = await cog.unregister_all_clans(MAIN_GUILD_ID)
+        except Exception as exc:
+            log.exception("Unregister-all failed")
+            return await interaction.followup.send(
+                embed=error_embed(
+                    "Unregister failed",
+                    "The databases were not cleared because the RCE sync "
+                    f"could not be confirmed.\n`{type(exc).__name__}`",
+                ),
+                ephemeral=True,
+            )
+
+        await interaction.followup.send(
+            embed=success_embed(
+                "All clans unregistered",
+                f"Removed **{deleted}** clan registration(s) from the RCE "
+                "and roster records.\nDiscord roles and channels were left in place.",
+            ),
+            ephemeral=True,
+        )
+
+    unregister_command = app_commands.Command(
+        name="unregister-all",
+        description="Remove all clan registrations (administrator only).",
+        callback=unregister_all_callback,
+    )
+    app_commands.default_permissions(administrator=True)(unregister_command)
 
     # Keep the recovery/admin command out of roster servers. A separate guild
     # scoped copy of the group gives the main guild both subcommands while the
@@ -1123,6 +1282,7 @@ async def setup(bot: commands.Bot) -> None:
     main_group = app_commands.Group(name="clan", description="Clan operations")
     main_group.add_command(make_recruit_command())
     main_group.add_command(register_command)
+    main_group.add_command(unregister_command)
     bot.tree.add_command(
         main_group,
         guild=discord.Object(id=MAIN_GUILD_ID),
